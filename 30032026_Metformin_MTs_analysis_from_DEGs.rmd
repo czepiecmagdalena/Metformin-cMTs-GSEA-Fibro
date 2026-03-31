@@ -1,0 +1,1693 @@
+---
+title: "Quick and easy pipeline for Gene Set Enrichment analysis of snRNAseq samples with metformin induced microtissue"
+subtitle: "Adapted from Gino Bonazza DCM samples analysis by Magdalena Czepiec and Maks Nęcki"
+author:
+  - name: Magdalena Czepiec
+    affiliation: Faculty of Clinical Immunology / Jagiellonian University Collegium Medicum
+  - name: Maks Nęcki
+    affiliation: Faculty of Clinical Immunology / Jagiellonian University Collegium Medicum
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+fontsize: 11pt
+geometry: margin=1in
+lang: en
+
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+    fig_width: 8
+    fig_height: 5
+    self_contained: true
+
+editor_options:
+  chunk_output_type: console
+
+params:
+  organism: "Homo sapiens"
+  analysis_type: "GSEA"
+---
+
+```{r pre-setup, message=FALSE, warning=FALSE}
+# minimalne pakiety do tabeli
+if (!requireNamespace("knitr", quietly = TRUE)) install.packages("knitr")
+if (!requireNamespace("kableExtra", quietly = TRUE)) install.packages("kableExtra")
+
+library(knitr)
+library(kableExtra)
+```
+
+
+
+# Introduction
+
+*Gene Set Enrichment Analysis* (GSEA) is a widely used approach for interpreting gene expression data in the context of biological pathways and processes. In this analysis, we investigate the transcriptional response of microtissue-derived cell populations to metformin treatment using single-nucleus RNA sequencing (snRNA-seq).
+
+The study focuses on two major cell types present in the microtissue model:
+- fibroblasts
+- cardiomyocytes
+
+The dataset consists of four experimental conditions derived from a single sequencing library. Key sample preparation and sequencing metrics are summarized below.
+
+```{r}
+
+sample_info <- data.frame(
+  Sample = c("cMTs - NC", "cMTs - MET", "cMTs - TGFb1", "cMTs - MET+TGFb1"),
+  `Collection Date` = rep("17.02.2026", 4),
+  `Culture Period` = rep("09–13.02.2026", 4),
+  `cDNA Concentration` = rep("8240 pg/ul", 4),
+  `Library` = rep("Library_11", 4),
+  `Library Concentration` = rep("5040 pg/ul", 4),
+  `Nuclei Input` = c(
+    "1333 nuclei",
+    "1440 nuclei",
+    "1653 nuclei",
+    "1433 nuclei"
+  ),
+  `Nuclei Output` = c(
+    "1437 nuclei",
+    "1291 nuclei",
+    "2142 nuclei",
+    "1339 nuclei"
+  )
+)
+
+kable(
+  sample_info,
+  col.names = c("Sample", "Collection Date", "Culture Period", 
+  "cDNA Concentration", "Library", "Library Concentration", "Nuclei Input", "Nuclei Output"),
+  caption = "Summary of snRNA-seq samples and library preparation metrics",
+  align = "c"
+) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+
+```
+
+
+Differential gene expression (DGE) analysis was performed separately for each cell type across three experimental comparisons:
+* **TGF_MET vs TGF**
+* **NC vs TGF**
+* **NC vs MET**
+
+The resulting DEG tables serve as input for downstream enrichment analysis using GSEA, enabling identification of biologically relevant pathways associated with treatment and condition-specific responses.
+
+This report provides a reproducible pipeline for performing GSEA and visualizing enrichment results.
+
+
+# GSEA Analysis of Microtissue snRNA-seq Data
+
+## Setup: Libraries and Environment
+
+```{r}
+
+package_info <- data.frame(
+  Package = c(
+    "dplyr",
+    "ggplot2",
+    "patchwork",
+    "clusterProfiler",
+    "org.Hs.eg.db",
+    "enrichplot",
+    "htmltools",
+    "tidyr",
+    "ReactomePA",
+    "Seurat"
+  ),
+  Description = c(
+    "Data manipulation",
+    "Data visualization",
+    "Plot composition",
+    "GSEA and enrichment analysis",
+    "Gene ID mapping",
+    "GSEA visualization",
+    "HTML content for RMarkdown/HTML reports",
+    "Data tidying and reshaping",
+    "Reactome pathway analysis",
+    "Single-cell RNA-seq analysis"
+  ),
+  Example_Functions = c(
+    "select(), filter(), mutate()",
+    "ggplot(), geom_point()",
+    "wrap_plots()",
+    "GSEA(), enrichGO()",
+    "mapIds()",
+    "gseaplot(), dotplot()",
+    "tags$div(), tags$details()",
+    "unnest(), pivot_longer()",
+    "reactomePathway(), enrichPathway()",
+    "Read10X(), VlnPlot(), FindMarkers()"
+  )
+)
+
+kable(package_info, caption = "Overview of used R packages", align = "ccc")
+```
+
+
+```{r installing and loading libraries}
+
+# ---- Package lists ----
+cran_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "patchwork",
+  "htmltools",
+  "tidyr",
+  "Seurat"
+)
+
+bioc_packages <- c(
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "enrichplot",
+  "ReactomePA"
+)
+
+# ---- Function to install & load ----
+install_and_load <- function(pkg, bioc = FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+      }
+      BiocManager::install(pkg, ask = FALSE, update = FALSE)
+    } else {
+      install.packages(pkg)
+    }
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# ---- Install & load CRAN packages ----
+invisible(lapply(cran_packages, install_and_load))
+
+# ---- Install & load Bioconductor packages ----
+invisible(lapply(bioc_packages, install_and_load, bioc = TRUE))
+```
+
+
+## Importing DEGs
+
+```{r}
+# ścieżka do folderu
+path <- "C:/Users/magda/Desktop/Lib_11_MTs_analiza od DEG/Fibro"
+
+# lista plików
+files <- c(
+  "deg_TGF_vs_NC_fibro.csv",
+  "deg_MET_TGF_vs_TGF_fibro.csv",
+  "deg_MET_vs_NC_fibro.csv"
+)
+```
+
+# Gene set enrichment analysis (GO, KEGG, Reactome)
+
+## GSEA GO BP (Biological Pathways)
+
+```{r}
+run_gsea_go <- function(file_name) {
+  
+  DEBUG <- TRUE
+  
+  cat("\n=============================\n")
+  cat("Processing:", file_name, "\n")
+  cat("=============================\n")
+  
+  # =========================================
+  # 🔹 1. INPUT (WCZYTANIE DANYCH)
+  # =========================================
+  deg <- read.csv(file.path(path, file_name))
+  
+  cat("\n[1] INPUT CHECK\n") #checkpoint
+  cat("Rows:", nrow(deg), "\n")
+  cat("Columns:", paste(colnames(deg), collapse = ", "), "\n")
+  
+  if (!all(c("gene", "avg_log2FC") %in% colnames(deg))) {
+    stop("Missing required columns: gene / avg_log2FC") # walidacja czy mamy wymagane kolumny
+  }
+
+  # =========================================
+  # 🔹 2. RANKING GENÓW
+  # =========================================
+  gene_rank_df <- deg %>%
+    dplyr::select(gene, avg_log2FC) %>% # wybieramy tylko potrzebne nam kolumny 
+    dplyr::rename(lfc = avg_log2FC) %>% 
+    dplyr::filter(!is.na(lfc)) %>% # usuwamy NA
+    dplyr::distinct() # usuwamy duplikaty wierszy
+  
+  cat("\n[2] RANKING CHECK\n") #checkpoint
+  cat("Genes after filtering:", nrow(gene_rank_df), "\n")
+  
+  if (DEBUG) {
+    cat("Top 5 genes by logFC:\n")
+    print(head(gene_rank_df[order(-gene_rank_df$lfc), ], 5))
+  }
+  # Tworzenie wektorów (logFC jako wartości, gene jako nazwy)
+  gene_rank <- gene_rank_df$lfc
+  names(gene_rank) <- gene_rank_df$gene
+  gene_rank <- sort(gene_rank, decreasing = TRUE) # sortowanie malejące (wymóg dla GSEA)
+
+  # =========================================
+  # 🔹 3. MAPOWANIE
+  # =========================================
+  gene_map <- bitr(
+    names(gene_rank),
+    fromType = "SYMBOL",
+    toType   = "ENTREZID", # konwersja symbol na entrezid (wymóg GSEA)
+    OrgDb    = org.Hs.eg.db
+  )
+  
+  cat("\n[3] MAPPING CHECK\n") #checkpoint
+  cat("Mapped genes:", nrow(gene_map), "\n") # ile genów udało się zmappować
+  cat("Mapping success rate:", # procent sukcesu mappowania
+      round(nrow(gene_map) / length(gene_rank) * 100, 2), "%\n")
+  
+  if (nrow(gene_map) == 0) {
+    stop("No genes mapped to ENTREZID")
+  }
+
+  # =========================================
+  # 🔹 4. geneList
+  # =========================================
+  gene_rank_df <- gene_rank_df %>% # łączenie logFC z ENTREZID
+    inner_join(gene_map, by = c("gene" = "SYMBOL"))
+  
+  geneList <- gene_rank_df$lfc # tworzenie finalnego wektora dla GSEA
+  names(geneList) <- gene_rank_df$ENTREZID
+  
+  geneList <- geneList[!duplicated(names(geneList))] # usuwanie duplikatów ENTREZID
+  geneList <- sort(geneList, decreasing = TRUE) # ponowne sortowanie malejące 
+  
+  cat("\n[4] geneList CHECK\n") #checkpoint
+  cat("Genes in ranked list:", length(geneList), "\n")
+  
+  if (length(geneList) < 50) {
+    warning("Very small ranked list — GSEA may be unstable") # informacja, czy nasz geneList length nie jest zbyt mały
+  }
+  
+  print(summary(geneList)) # statystyki (min, max, median)
+
+  if (DEBUG) {
+  cat("Top 5 geneList:\n")
+  print(head(geneList, 5))
+  cat("Bottom 5 geneList:\n")
+  print(head(sort(geneList), 5))
+  }
+  # dodatkowe checki (stop jeśli nasze dane zawierają NA lub duplicated IDs - nie powinny bo usuwamy wcześniej)
+  if (any(is.na(geneList))) stop("NA in geneList")
+  if (any(duplicated(names(geneList)))) stop("Duplicated ENTREZ IDs")
+
+  # =========================================
+  # 🔹 5. GSEA
+  # =========================================
+  GSEA_GO <- tryCatch(
+    gseGO(
+      geneList      = geneList, # ranking genów
+      OrgDb         = org.Hs.eg.db, # baza adnotacji
+      ont           = "BP", # Biological Process, inne które mogą być CC (Cellular Component), MF (Molecular Function)
+      minGSSize     = 5, # zakres wielkości pathway
+      maxGSSize     = 1000, # zakres wielkości pathway
+      pvalueCutoff  = 0.05, # p-value 
+      verbose       = FALSE, # wyłącza szczegółowe komunikaty (logi) generowane podczas obliczeń
+      eps           = 0, # dokładniejsze p-value
+      nPermSimple   = 20000 # liczba permutacji, czyli program miesza dane setki razy, dzięki temu wiemy, jakie wyniki wzbogacenia (Enrichment Score) pojawiają się przy czystym przypadku
+    ),                      # permutacje pozwalają obliczyć FDR (False Discovery Rate), który mówi Ci, ile z Twoich „istotnych” wyników to prawdopodobnie fałszywe alarmy
+    error = function(e) {
+      message("GSEA failed: ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(GSEA_GO) || nrow(as.data.frame(GSEA_GO)) == 0) { # brak wyników → stop
+    message("No significant GSEA terms.")
+    return(NULL)
+  }
+  # konwersja do dataframe
+  res <- as.data.frame(GSEA_GO)
+
+  cat("\n[5] GSEA RESULT CHECK\n") #checkpoint
+  cat("Pathways:", nrow(res), "\n")
+  print(summary(res$NES)) # rozkład enrichment score
+
+  if (DEBUG) {
+  cat("Top 5 NES:\n")
+  print(head(res[order(-res$NES), c("Description", "NES", "p.adjust")], 5))
+  
+  cat("Bottom 5 NES:\n")
+  print(head(res[order(res$NES), c("Description", "NES", "p.adjust")], 5))
+  }
+
+  # =================================================
+  # 🔹 6. PODZIAŁ (Activated and Suppressed) + plots
+  # =================================================
+
+activated_terms <- subset(GSEA_GO@result, NES > 0)
+suppressed_terms <- subset(GSEA_GO@result, NES < 0)
+cat("\n[6] SPLIT CHECK\n") #checkpoint
+cat("Activated:", nrow(activated_terms), "\n")
+cat("Suppressed:", nrow(suppressed_terms), "\n")
+GSEA_GO_activated <- GSEA_GO
+GSEA_GO_activated@result <- activated_terms
+GSEA_GO_suppressed <- GSEA_GO
+GSEA_GO_suppressed@result <- suppressed_terms
+
+# Paiwise_termsim 
+# obliczenie podobieństwa między terminami (np. pathway, GO terms) w oparciu o ich geny lub strukturę ontologii
+# efektem jest macierz, którą można potem wykorzystać np. w wizualizacji typu emapplot, żeby:
+#   - pokazać, które szlaki są do siebie podobne
+#   - grupować szlaki w tzw. clusters, aby łatwiej interpretować wyniki GSEA
+
+# Paiwise_termsim activated
+if (nrow(GSEA_GO_activated@result) > 2) {
+GSEA_GO_activated <- pairwise_termsim(GSEA_GO_activated) # Liczy podobieństwo między pathway (do sieci/emapplot)
+} else {
+cat("Skipping pairwise_termsim for activated (<=2 terms)\n")
+}
+
+# Pairwise_termsim suppressed
+if (nrow(GSEA_GO_suppressed@result) > 2) {
+GSEA_GO_suppressed <- pairwise_termsim(GSEA_GO_suppressed)
+} else {
+cat("Skipping pairwise_termsim for suppressed (<=2 terms)\n")
+}
+
+# sortowanie
+if (DEBUG) {
+  cat("\nTop 10 Activated:\n")
+  print(head(GSEA_GO_activated@result[, c("Description", "NES")], 10))
+  cat("\nTop 10 Suppressed:\n")
+  print(head(GSEA_GO_suppressed@result[, c("Description", "NES")], 10))
+}
+
+  name <- gsub(".csv", "", file_name)
+
+  # plot activated
+if (nrow(GSEA_GO_activated@result) > 1) {
+p <- emapplot(
+GSEA_GO_activated,
+showCategory = min(40, nrow(GSEA_GO_activated@result)),
+size_category = 1.0,
+min_edge = 0.3,
+layout = "kk",
+color = "NES"
+)
+#png(paste0("GSEA_GO_", name, "_activated.png"), 1600, 800)
+print(p)
+#dev.off()
+} else {
+cat("Skipping activated plot (<=1 term)\n")
+}
+ 
+  # plot suppressed
+if (nrow(GSEA_GO_suppressed@result) > 1) {
+p_sup <- emapplot(
+GSEA_GO_suppressed,
+showCategory = min(40, nrow(GSEA_GO_suppressed@result)),
+size_category = 1.0,
+min_edge = 0.3,
+layout = "kk",
+color = "NES"
+)
+#png(paste0("GSEA_GO_", name, "_suppressed.png"), 1600, 800)
+print(p_sup)
+#dev.off()
+} else {
+cat("Skipping suppressed plot (<=1 term)\n")
+}
+
+  # =========================================
+  # 🔹 7. ZAPIS do global environment
+  # =========================================
+
+  # Umożliwia zapis obiektów i wywołanie ich w terminalu (patrz: struktura obektów GSEA GO)
+  assign(paste0(name, "_GSEA_GO"), GSEA_GO, envir = .GlobalEnv)
+  assign(paste0(name, "_GSEA_GO_activated"), GSEA_GO_activated, envir = .GlobalEnv)
+  assign(paste0(name, "_GSEA_GO_suppressed"), GSEA_GO_suppressed, envir = .GlobalEnv)
+
+  cat("\n✔ Saved objects:\n")
+  cat(paste0(name, "_GSEA_GO\n"))
+  cat(paste0(name, "_GSEA_GO_activated\n"))
+  cat(paste0(name, "_GSEA_GO_suppressed\n"))
+
+  cat("\nDONE:", name, "\n")
+}
+
+# Informacja dla jakiego powtórzenia wykonujemy całą funkcję:
+# 3) MET vs NC 
+#run_gsea_go("deg_MET_vs_NC.csv")
+```
+
+```{r}
+# Na dole funkcji podmieniamy dla jakiego porównania chcemy zrobić analizę jeśli chcemy pojedynczo, zamiast pętli:
+
+# 1) TGF vs NC
+run_gsea_go("deg_TGF_vs_NC_fibro.csv")
+
+# 2) TGFMET vs MET
+run_gsea_go("deg_MET_TGF_vs_TGF_fibro.csv")
+
+# 3) MET vs NC 
+run_gsea_go("deg_MET_vs_NC_fibro.csv")
+```
+
+## STRUKTURA OBIEKTÓW GSEA_GO
+```{r}
+# Jeśli chcemy wywołać cały plik wystarczy wpisać te nazwy w terminalu:
+#deg_TGF_vs_NC_fibro_GSEA_GO
+#deg_TGF_vs_NC_fibro_GSEA_GO_activated
+#deg_TGF_vs_NC_fibro_GSEA_GO_suppressed
+
+#deg_MET_TGF_vs_TGF_fibro_GSEA_GO
+#deg_MET_TGF_vs_TGF_fibro_GSEA_GO_activated
+#deg_MET_TGF_vs_TGF_fibro_GSEA_GO_suppressed
+
+#deg_MET_vs_NC_fibro_GSEA_GO
+#deg_MET_vs_NC_fibro_GSEA_GO_activated
+#deg_MET_vs_NC_fibro_GSEA_GO_suppressed
+
+# Funkcja do wywołania konkretnych parametrów (head_nazwapliku@result(wybrane))
+# head(deg_TGF_vs_NC_GSEA_GO_activated@result[, c("NES", "p.adjust")], 20)
+```
+
+
+# GSEA GO BP hierarchy
+## Mapuje termy na wyższe kategorie za pomocą GO hierarchy (level = 3).
+  - Poziom 1 → root („biological_process”),
+  - Poziom 2 → duże podkategorie,
+  - Poziom 3 → szersze kategorie typu „Metabolism”, „Signal transduction”, „Immune response” itp.
+## Tworzy agregację NES po kategoriach (liczy średni NES i liczbę termów w niej zawartych).
+## Generuje wykres słupkowy dla kategorii (activated i suppressed).
+## Generuje emapplot z węzłami = kategorie (activated i suppressed).
+
+```{r}
+run_gsea_go_hierarchy <- function(gsea_obj, name, DEBUG = TRUE) {
+  
+  
+  cat("\n=============================\n")
+  cat("Processing hierarchy:", name, "\n")
+  cat("=============================\n")
+  
+  res <- as.data.frame(gsea_obj@result)
+  
+  if (nrow(res) == 0) {
+    message("No GSEA results")
+    return(NULL)
+  }
+  
+  # =========================================
+  # 🔹 1. INPUT CHECK
+  # =========================================
+  cat("\n[1] INPUT CHECK\n")
+  cat("Pathways:", nrow(res), "\n")
+  
+  cat("\nNES distribution:\n")
+  print(table(res$NES > 0))
+  
+  # =========================================
+  # 🔹 2. CATEGORY (NOWA LOGIKA)
+  # =========================================
+  get_category <- function(desc) {
+    
+    desc <- tolower(desc)
+    
+    if (grepl("metabolic|biosynthetic|catabolic|atp|glycolysis", desc)) return("Metabolism")
+    if (grepl("immune|inflammatory|cytokine", desc)) return("Immune")
+    if (grepl("migration|motility|locomotion", desc)) return("Migration")
+    if (grepl("proliferation|cell cycle|division", desc)) return("Cell cycle")
+    if (grepl("signaling|signal|receptor", desc)) return("Signaling")
+    if (grepl("development|differentiation", desc)) return("Development")
+    if (grepl("apoptosis|death", desc)) return("Cell death")
+    
+    return("Other")
+  }
+  
+  res$Category <- sapply(res$Description, get_category)
+  
+
+  cat("\n[2] CATEGORY CHECK\n")
+  print(table(res$Category))
+  
+  if (DEBUG) {
+    cat("\nSample mapping:\n")
+    print(head(res[, c("Description", "NES", "Category")], 10))
+  }
+  
+  # =========================================
+  # 🔹 3. FILTR (opcjonalny ale zalecany)
+  # =========================================
+  if (sum(res$p.adjust < 0.05) > 0) {
+    res <- res %>% dplyr::filter(p.adjust < 0.05)
+  } else {
+    cat("⚠ No significant terms at 0.05 — using all\n")
+  }
+  
+  # usuń śmieciową kategorię
+  res <- res %>% dplyr::filter(Category != "Other")
+  
+  # =========================================
+  # 🔹 4. SPLIT
+  # =========================================
+  res_activated <- dplyr::filter(res, NES > 0)
+  res_suppressed <- dplyr::filter(res, NES < 0)
+  
+  cat("\n[3] SPLIT CHECK\n")
+  cat("Activated:", nrow(res_activated), "\n")
+  cat("Suppressed:", nrow(res_suppressed), "\n")
+  
+  # =========================================
+  # 🔹 5. AGREGACJA
+  # =========================================
+  agg_fun <- function(df) {
+    df %>%
+      dplyr::group_by(Category) %>%
+      dplyr::summarize(
+        mean_NES = mean(NES),
+        max_NES = max(NES),
+        min_NES = min(NES),
+        count = n(),
+        .groups = "drop"
+      )
+  }
+  
+  activated_grouped <- agg_fun(res_activated) %>%
+    dplyr::arrange(desc(max_NES))
+  
+  suppressed_grouped <- agg_fun(res_suppressed) %>%
+    dplyr::arrange(min_NES)
+  
+  if (DEBUG) {
+    cat("\nTop Activated Categories:\n")
+    print(activated_grouped)
+    
+    cat("\nTop Suppressed Categories:\n")
+    print(suppressed_grouped)
+  }
+  
+  # opcjonalnie: top N
+  activated_grouped <- head(activated_grouped, 10)
+  suppressed_grouped <- head(suppressed_grouped, 10)
+  
+  # =========================================
+  # 🔹 6a. PLOT BAR
+  # =========================================
+  plot_grouped <- function(df, title) {
+    
+    if (nrow(df) == 0) {
+      cat("Empty dataframe - skipping plot\n")
+      return(NULL)
+    }
+    
+    ggplot(df, aes(x = reorder(Category, max_NES), y = max_NES, fill = max_NES)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      scale_fill_gradient2(
+        low = "blue",
+        mid = "white",
+        high = "red",
+        midpoint = 0
+      ) +
+      labs(title = title, x = "Category", y = "Max NES") +
+      theme_minimal(base_size = 14)
+  }
+  
+  # =========================================
+  # 🔹 6b. PLOT HEATMAP
+  # =========================================
+  plot_heatmap <- function(df, title) {
+    if (nrow(df) == 0) {
+      cat("Empty dataframe - skipping heatmap\n")
+      return(NULL)
+    }
+    
+    ggplot(df, aes(x = Category, y = Description, fill = NES)) +
+      geom_tile(color = "grey80") +
+      scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+      labs(title = title, x = "Category", y = "", fill = "NES") +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.y = element_text(size = 8))
+  }
+  
+  # PLOT BOX
+plot_box_grouped <- function(df, title) {
+  
+  if (nrow(df) == 0) {
+    cat("Empty dataframe - skipping boxplot\n")
+    return(NULL)
+  }
+  
+ # Dodaj liczebność do nazw kategorii
+df_counts <- df %>%
+  group_by(Category) %>%
+  summarise(n = n()) %>%
+  mutate(Category_label = paste0(Category, " (n=", n, ")"))
+
+# Dołączenie nowych etykiet do df
+df <- df %>%
+  left_join(df_counts, by = "Category")
+
+ggplot(df, aes(x = NES, y = Category_label, fill = Category)) +
+  geom_boxplot(outlier.shape = NA) +  # Boxy kolorowe
+  geom_jitter(width = 0.2, alpha = 0.6, color = "black", size = 2, show.legend = FALSE) +  # Punkty czarne/przezroczyste
+  coord_flip() +
+  scale_fill_brewer(palette = "Set3") +  # Kolor boxów
+  labs(title = title, x = "NES", y = "Category") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")  # usuwa legendę
+}
+ # Box plots
+if (nrow(res_activated) > 0) {
+  p_act_box <- plot_box_grouped(res_activated, paste0(name, " - Activated"))
+  ggsave(paste0("GSEA_GO_", name, "_hier_activated_boxplot.png"), p_act_box, width = 10, height = 6)
+  print(p_act_box)
+}
+
+if (nrow(res_suppressed) > 0) {
+  p_sup_box <- plot_box_grouped(res_suppressed, paste0(name, " - Suppressed"))
+  ggsave(paste0("GSEA_GO_", name, "_hier_suppressed_boxplot.png"), p_sup_box, width = 10, height = 6)
+  print(p_sup_box)
+}
+  
+  # Heatmaps
+  if (nrow(res_activated) > 0) {
+    hm_act <- plot_heatmap(res_activated, paste0(name, " - Activated Heatmap"))
+    ggsave(paste0("GSEA_GO_", name, "_hier_activated_heatmap.png"), hm_act, width = 10, height = 8)
+    print(hm_act)
+  }
+  
+  if (nrow(res_suppressed) > 0) {
+    hm_sup <- plot_heatmap(res_suppressed, paste0(name, " - Suppressed Heatmap"))
+    ggsave(paste0("GSEA_GO_", name, "_hier_suppressed_heatmap.png"), hm_sup, width = 10, height = 8)
+    print(hm_sup)
+  }
+
+  
+  # =========================================
+  # 🔹 7. SAVE OBJECTS
+  # =========================================
+  assign(paste0(name, "_hier_full"), res, envir = .GlobalEnv)
+  assign(paste0(name, "_hier_activated"), activated_grouped, envir = .GlobalEnv)
+  assign(paste0(name, "_hier_suppressed"), suppressed_grouped, envir = .GlobalEnv)
+  
+  cat("\n✔ Saved objects:\n")
+  cat(paste0(name, "_hier_full\n"))
+  cat(paste0(name, "_hier_activated\n"))
+  cat(paste0(name, "_hier_suppressed\n"))
+  
+  cat("\nDONE:", name, "\n")
+}
+
+# 2) TGFMET vs MET
+#run_gsea_go_hierarchy(deg_MET_TGF_vs_TGF_GSEA_GO, "TGFMET_vs_TGF")
+```
+
+```{r}
+# Na dole funkcji podmieniamy dla jakiego porównania chcemy zrobić analizę
+# 1) TGF vs NC
+run_gsea_go_hierarchy(deg_TGF_vs_NC_fibro_GSEA_GO, "TGF_vs_NC_fibro")
+
+# 2) TGFMET vs MET
+run_gsea_go_hierarchy(deg_MET_TGF_vs_TGF_fibro_GSEA_GO, "TGFMET_vs_TGF_fibro")
+
+# 3) MET vs NC
+run_gsea_go_hierarchy(deg_MET_vs_NC_fibro_GSEA_GO, "MET_vs_NC_fibro")
+
+```
+
+## GSEA KEGG
+```{r}
+run_gsea_kegg <- function(file_name) {
+  
+  DEBUG <- TRUE
+  
+  cat("\n=============================\n")
+  cat("Processing:", file_name, "\n")
+  cat("=============================\n")
+  
+  # =========================================
+  # 🔹 1. INPUT (WCZYTANIE DANYCH)
+  # =========================================
+  deg <- read.csv(file.path(path, file_name))
+  
+  cat("\n[1] INPUT CHECK\n") #checkpoint
+  cat("Rows:", nrow(deg), "\n")
+  cat("Columns:", paste(colnames(deg), collapse = ", "), "\n")
+  
+  if (!all(c("gene", "avg_log2FC") %in% colnames(deg))) {
+    stop("Missing required columns: gene / avg_log2FC") # walidacja czy mamy wymagane kolumny
+  }
+
+  # =========================================
+  # 🔹 2. RANKING GENÓW
+  # =========================================
+  gene_rank_df <- deg %>%
+    dplyr::select(gene, avg_log2FC) %>% # wybieramy tylko potrzebne nam kolumny 
+    dplyr::rename(lfc = avg_log2FC) %>% 
+    dplyr::filter(!is.na(lfc)) %>% # usuwamy NA
+    dplyr::distinct() # usuwamy duplikaty wierszy
+  
+  cat("\n[2] RANKING CHECK\n") #checkpoint
+  cat("Genes after filtering:", nrow(gene_rank_df), "\n")
+  
+  if (DEBUG) {
+    cat("Top 5 genes by logFC:\n")
+    print(head(gene_rank_df[order(-gene_rank_df$lfc), ], 5))
+  }
+  # Tworzenie wektorów (logFC jako wartości, gene jako nazwy)
+  gene_rank <- gene_rank_df$lfc
+  names(gene_rank) <- gene_rank_df$gene
+  gene_rank <- sort(gene_rank, decreasing = TRUE) # sortowanie malejące (wymóg dla GSEA)
+
+  # =========================================
+  # 🔹 3. MAPOWANIE
+  # =========================================
+  gene_map <- bitr(
+    names(gene_rank),
+    fromType = "SYMBOL",
+    toType   = "ENTREZID", # konwersja symbol na entrezid (wymóg GSEA)
+    OrgDb    = org.Hs.eg.db
+  )
+  
+  cat("\n[3] MAPPING CHECK\n") #checkpoint
+  cat("Mapped genes:", nrow(gene_map), "\n") # ile genów udało się zmappować
+  cat("Mapping success rate:", # procent sukcesu mappowania
+      round(nrow(gene_map) / length(gene_rank) * 100, 2), "%\n")
+  
+  if (nrow(gene_map) == 0) {
+    stop("No genes mapped to ENTREZID")
+  }
+
+  # =========================================
+  # 🔹 4. geneList
+  # =========================================
+  gene_rank_df <- gene_rank_df %>% # łączenie logFC z ENTREZID
+    inner_join(gene_map, by = c("gene" = "SYMBOL"))
+  
+  geneList <- gene_rank_df$lfc # tworzenie finalnego wektora dla GSEA
+  names(geneList) <- gene_rank_df$ENTREZID
+  
+  geneList <- geneList[!duplicated(names(geneList))] # usuwanie duplikatów ENTREZID
+  geneList <- sort(geneList, decreasing = TRUE) # ponowne sortowanie malejące 
+  
+  cat("\n[4] geneList CHECK\n") #checkpoint
+  cat("Genes in ranked list:", length(geneList), "\n")
+  
+  if (length(geneList) < 50) {
+    warning("Very small ranked list — GSEA may be unstable") # informacja, czy nasz geneList length nie jest zbyt mały
+  }
+  
+  print(summary(geneList)) # statystyki (min, max, median)
+
+  if (DEBUG) {
+  cat("Top 5 geneList:\n")
+  print(head(geneList, 5))
+  cat("Bottom 5 geneList:\n")
+  print(head(sort(geneList), 5))
+  }
+  # dodatkowe checki (stop jeśli nasze dane zawierają NA lub duplicated IDs - nie powinny bo usuwamy wcześniej)
+  if (any(is.na(geneList))) stop("NA in geneList")
+  if (any(duplicated(names(geneList)))) stop("Duplicated ENTREZ IDs")
+
+  # =========================================
+  # 🔹 5. GSEA
+  # =========================================
+  GSEA_KEGG <- tryCatch(
+    gseKEGG(geneList = geneList, organism = "hsa",
+                minGSSize = 5, maxGSSize = 1000, pvalueCutoff = 0.05, verbose = FALSE),                      # permutacje pozwalają obliczyć FDR (False Discovery Rate), który mówi Ci, ile z Twoich „istotnych” wyników to prawdopodobnie fałszywe alarmy
+    error = function(e) {
+      message("GSEA failed: ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(GSEA_KEGG) || nrow(as.data.frame(GSEA_KEGG)) == 0) { # brak wyników → stop
+    message("No significant GSEA terms.")
+    return(NULL)
+  }
+  # konwersja do dataframe
+  res <- as.data.frame(GSEA_KEGG)
+
+  cat("\n[5] GSEA RESULT CHECK\n") #checkpoint
+  cat("Pathways:", nrow(res), "\n")
+  print(summary(res$NES)) # rozkład enrichment score
+
+  if (DEBUG) {
+  cat("Top 5 NES:\n")
+  print(head(res[order(-res$NES), c("Description", "NES", "p.adjust")], 5))
+  
+  cat("Bottom 5 NES:\n")
+  print(head(res[order(res$NES), c("Description", "NES", "p.adjust")], 5))
+  }
+
+  # =================================================
+  # 🔹 6. PODZIAŁ (Activated and Suppressed) + plots
+  # =================================================
+
+activated_terms <- subset(GSEA_KEGG@result, NES > 0)
+suppressed_terms <- subset(GSEA_KEGG@result, NES < 0)
+cat("\n[6] SPLIT CHECK\n") #checkpoint
+cat("Activated:", nrow(activated_terms), "\n")
+cat("Suppressed:", nrow(suppressed_terms), "\n")
+GSEA_KEGG_activated <- GSEA_KEGG
+GSEA_KEGG_activated@result <- activated_terms
+GSEA_KEGG_suppressed <- GSEA_KEGG
+GSEA_KEGG_suppressed@result <- suppressed_terms
+
+# Paiwise_termsim 
+# obliczenie podobieństwa między terminami (np. pathway, GO terms) w oparciu o ich geny lub strukturę ontologii
+# efektem jest macierz, którą można potem wykorzystać np. w wizualizacji typu emapplot, żeby:
+#   - pokazać, które szlaki są do siebie podobne
+#   - grupować szlaki w tzw. clusters, aby łatwiej interpretować wyniki GSEA
+
+# Paiwise_termsim activated
+if (nrow(GSEA_KEGG_activated@result) > 2) {
+GSEA_KEGG_activated <- pairwise_termsim(GSEA_KEGG_activated) # Liczy podobieństwo między pathway (do sieci/emapplot)
+} else {
+cat("Skipping pairwise_termsim for activated (<=2 terms)\n")
+}
+
+# Pairwise_termsim suppressed
+if (nrow(GSEA_KEGG_suppressed@result) > 2) {
+GSEA_KEGG_suppressed <- pairwise_termsim(GSEA_KEGG_suppressed)
+} else {
+cat("Skipping pairwise_termsim for suppressed (<=2 terms)\n")
+}
+
+# sortowanie
+if (DEBUG) {
+  cat("\nTop 10 Activated:\n")
+  print(head(GSEA_KEGG_activated@result[, c("Description", "NES")], 10))
+  cat("\nTop 10 Suppressed:\n")
+  print(head(GSEA_KEGG_suppressed@result[, c("Description", "NES")], 10))
+}
+
+  name <- gsub(".csv", "", file_name)
+
+  # plot activated
+if (nrow(GSEA_KEGG_activated@result) > 1) {
+p <- emapplot(
+GSEA_KEGG_activated,
+showCategory = min(40, nrow(GSEA_KEGG_activated@result)),
+size_category = 1.0,
+min_edge = 0.3,
+layout = "kk",
+color = "NES"
+)
+#png(paste0("GSEA_KEGG_", name, "_activated.png"), 1600, 800)
+print(p)
+#dev.off()
+} else {
+cat("Skipping activated plot (<=1 term)\n")
+}
+ 
+  # plot suppressed
+if (nrow(GSEA_KEGG_suppressed@result) > 1) {
+p_sup <- emapplot(
+GSEA_KEGG_suppressed,
+showCategory = min(40, nrow(GSEA_KEGG_suppressed@result)),
+size_category = 1.0,
+min_edge = 0.3,
+layout = "kk",
+color = "NES"
+)
+#png(paste0("GSEA_KEGG_", name, "_suppressed.png"), 1600, 800)
+print(p_sup)
+#dev.off()
+} else {
+cat("Skipping suppressed plot (<=1 term)\n")
+}
+
+  # =========================================
+  # 🔹 7. ZAPIS do global environment
+  # =========================================
+
+  # Umożliwia zapis obiektów i wywołanie ich w terminalu (patrz: struktura obektów GSEA GO)
+  assign(paste0(name, "_GSEA_KEGG"), GSEA_KEGG, envir = .GlobalEnv)
+  assign(paste0(name, "_GSEA_KEGG_activated"), GSEA_KEGG_activated, envir = .GlobalEnv)
+  assign(paste0(name, "_GSEA_KEGG_suppressed"), GSEA_KEGG_suppressed, envir = .GlobalEnv)
+
+  cat("\n✔ Saved objects:\n")
+  cat(paste0(name, "_GSEA_KEGG\n"))
+  cat(paste0(name, "_GSEA_KEGG_activated\n"))
+  cat(paste0(name, "_GSEA_KEGG_suppressed\n"))
+
+  cat("\nDONE:", name, "\n")
+}
+
+# 2) TGFMET vs MET
+#run_gsea_kegg("deg_MET_TGF_vs_TGF.csv")
+```
+
+```{r}
+# Na dole funkcji podmieniamy dla jakiego porównania chcemy zrobić analizę jeśli chcemy pojedynczo, zamiast pętli:
+
+# 1) TGF vs NC
+run_gsea_kegg("deg_TGF_vs_NC_fibro.csv")
+
+# 2) TGFMET vs MET
+run_gsea_kegg("deg_MET_TGF_vs_TGF_fibro.csv")
+
+# 3) MET vs NC 
+run_gsea_kegg("deg_MET_vs_NC_fibro.csv")
+```
+
+## STRUKTURA OBIEKTÓW GSEA_KEGG
+```{r}
+# Jeśli chcemy wywołać cały plik wystarczy wpisać te nazwy w terminalu:
+#deg_TGF_vs_NC_fibro_GSEA_KEGG
+#deg_TGF_vs_NC_fibro_GSEA_KEGG_activated
+#deg_TGF_vs_NC_fibro_GSEA_KEGG_suppressed
+
+#deg_MET_TGF_vs_TGF_fibro_GSEA_KEGG
+#deg_MET_TGF_vs_TGF_fibro_GSEA_KEGG_activated
+#deg_MET_TGF_vs_TGF_fibro_GSEA_KEGG_suppressed
+
+#deg_MET_vs_NC_fibro_GSEA_KEGG
+#deg_MET_vs_NC_fibro_GSEA_KEGG_activated
+#deg_MET_vs_NC_fibro_GSEA_KEGG_suppressed
+
+# Funkcja do wywołania konkretnych parametrów (head_nazwapliku@result(wybrane))
+```
+
+## GSEA Reactome
+```{r}
+run_gsea_reactome <- function(file_name) {
+  
+  DEBUG <- TRUE
+  
+  cat("\n=============================\n")
+  cat("Processing:", file_name, "\n")
+  cat("=============================\n")
+  
+  # =========================================
+  # 🔹 1. INPUT (WCZYTANIE DANYCH)
+  # =========================================
+  deg <- read.csv(file.path(path, file_name))
+  
+  cat("\n[1] INPUT CHECK\n") #checkpoint
+  cat("Rows:", nrow(deg), "\n")
+  cat("Columns:", paste(colnames(deg), collapse = ", "), "\n")
+  
+  if (!all(c("gene", "avg_log2FC") %in% colnames(deg))) {
+    stop("Missing required columns: gene / avg_log2FC") # walidacja czy mamy wymagane kolumny
+  }
+
+  # =========================================
+  # 🔹 2. RANKING GENÓW
+  # =========================================
+  gene_rank_df <- deg %>%
+    dplyr::select(gene, avg_log2FC) %>% # wybieramy tylko potrzebne nam kolumny 
+    dplyr::rename(lfc = avg_log2FC) %>% 
+    dplyr::filter(!is.na(lfc)) %>% # usuwamy NA
+    dplyr::distinct() # usuwamy duplikaty wierszy
+  
+  cat("\n[2] RANKING CHECK\n") #checkpoint
+  cat("Genes after filtering:", nrow(gene_rank_df), "\n")
+  
+  if (DEBUG) {
+    cat("Top 5 genes by logFC:\n")
+    print(head(gene_rank_df[order(-gene_rank_df$lfc), ], 5))
+  }
+  # Tworzenie wektorów (logFC jako wartości, gene jako nazwy)
+  gene_rank <- gene_rank_df$lfc
+  names(gene_rank) <- gene_rank_df$gene
+  gene_rank <- sort(gene_rank, decreasing = TRUE) # sortowanie malejące (wymóg dla GSEA)
+
+  # =========================================
+  # 🔹 3. MAPOWANIE
+  # =========================================
+  gene_map <- bitr(
+    names(gene_rank),
+    fromType = "SYMBOL",
+    toType   = "ENTREZID", # konwersja symbol na entrezid (wymóg GSEA)
+    OrgDb    = org.Hs.eg.db
+  )
+  
+  cat("\n[3] MAPPING CHECK\n") #checkpoint
+  cat("Mapped genes:", nrow(gene_map), "\n") # ile genów udało się zmappować
+  cat("Mapping success rate:", # procent sukcesu mappowania
+      round(nrow(gene_map) / length(gene_rank) * 100, 2), "%\n")
+  
+  if (nrow(gene_map) == 0) {
+    stop("No genes mapped to ENTREZID")
+  }
+
+  # =========================================
+  # 🔹 4. geneList
+  # =========================================
+  gene_rank_df <- gene_rank_df %>% # łączenie logFC z ENTREZID
+    inner_join(gene_map, by = c("gene" = "SYMBOL"))
+  
+  geneList <- gene_rank_df$lfc # tworzenie finalnego wektora dla GSEA
+  names(geneList) <- gene_rank_df$ENTREZID
+  
+  geneList <- geneList[!duplicated(names(geneList))] # usuwanie duplikatów ENTREZID
+  geneList <- sort(geneList, decreasing = TRUE) # ponowne sortowanie malejące 
+  
+  cat("\n[4] geneList CHECK\n") #checkpoint
+  cat("Genes in ranked list:", length(geneList), "\n")
+  
+  if (length(geneList) < 50) {
+    warning("Very small ranked list — GSEA may be unstable") # informacja, czy nasz geneList length nie jest zbyt mały
+  }
+  
+  print(summary(geneList)) # statystyki (min, max, median)
+
+  if (DEBUG) {
+  cat("Top 5 geneList:\n")
+  print(head(geneList, 5))
+  cat("Bottom 5 geneList:\n")
+  print(head(sort(geneList), 5))
+  }
+  # dodatkowe checki (stop jeśli nasze dane zawierają NA lub duplicated IDs - nie powinny bo usuwamy wcześniej)
+  if (any(is.na(geneList))) stop("NA in geneList")
+  if (any(duplicated(names(geneList)))) stop("Duplicated ENTREZ IDs")
+
+  # =========================================
+  # 🔹 5. GSEA
+  # =========================================
+  GSEA_REACTOME <- tryCatch(
+    gseKEGG(geneList = geneList, organism = "human",
+                               minGSSize = 5, maxGSSize = 1000, pvalueCutoff = 0.05, verbose = FALSE),                      # permutacje pozwalają obliczyć FDR (False Discovery Rate), który mówi Ci, ile z Twoich „istotnych” wyników to prawdopodobnie fałszywe alarmy
+    error = function(e) {
+      message("GSEA failed: ", e$message)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(GSEA_REACTOME) || nrow(as.data.frame(GSEA_REACTOME)) == 0) { # brak wyników → stop
+    message("No significant GSEA terms.")
+    return(NULL)
+  }
+  # konwersja do dataframe
+  res <- as.data.frame(GSEA_REACTOME)
+
+  cat("\n[5] GSEA RESULT CHECK\n") #checkpoint
+  cat("Pathways:", nrow(res), "\n")
+  print(summary(res$NES)) # rozkład enrichment score
+
+  if (DEBUG) {
+  cat("Top 5 NES:\n")
+  print(head(res[order(-res$NES), c("Description", "NES", "p.adjust")], 5))
+  
+  cat("Bottom 5 NES:\n")
+  print(head(res[order(res$NES), c("Description", "NES", "p.adjust")], 5))
+  }
+
+  # =================================================
+  # 🔹 6. PODZIAŁ (Activated and Suppressed) + plots
+  # =================================================
+
+activated_terms <- subset(GSEA_REACTOME@result, NES > 0)
+suppressed_terms <- subset(GSEA_REACTOME@result, NES < 0)
+cat("\n[6] SPLIT CHECK\n") #checkpoint
+cat("Activated:", nrow(activated_terms), "\n")
+cat("Suppressed:", nrow(suppressed_terms), "\n")
+GSEA_REACTOME_activated <- GSEA_REACTOME
+GSEA_REACTOME_activated@result <- activated_terms
+GSEA_REACTOME_suppressed <- GSEA_REACTOME
+GSEA_REACTOME_suppressed@result <- suppressed_terms
+
+# Paiwise_termsim 
+# obliczenie podobieństwa między terminami (np. pathway, GO terms) w oparciu o ich geny lub strukturę ontologii
+# efektem jest macierz, którą można potem wykorzystać np. w wizualizacji typu emapplot, żeby:
+#   - pokazać, które szlaki są do siebie podobne
+#   - grupować szlaki w tzw. clusters, aby łatwiej interpretować wyniki GSEA
+
+# Paiwise_termsim activated
+if (nrow(GSEA_REACTOME_activated@result) > 2) {
+GSEA_REACTOME_activated <- pairwise_termsim(GSEA_REACTOME_activated) # Liczy podobieństwo między pathway (do sieci/emapplot)
+} else {
+cat("Skipping pairwise_termsim for activated (<=2 terms)\n")
+}
+
+# Pairwise_termsim suppressed
+if (nrow(GSEA_REACTOME_suppressed@result) > 2) {
+GSEA_REACTOME_suppressed <- pairwise_termsim(GSEA_REACTOME_suppressed)
+} else {
+cat("Skipping pairwise_termsim for suppressed (<=2 terms)\n")
+}
+
+# sortowanie
+if (DEBUG) {
+  cat("\nTop 10 Activated:\n")
+  print(head(GSEA_REACTOME_activated@result[, c("Description", "NES")], 10))
+  cat("\nTop 10 Suppressed:\n")
+  print(head(GSEA_REACTOME_suppressed@result[, c("Description", "NES")], 10))
+}
+
+  name <- gsub(".csv", "", file_name)
+
+  # plot activated
+if (nrow(GSEA_REACTOME_activated@result) > 1) {
+p <- emapplot(
+GSEA_REACTOME_activated,
+showCategory = min(40, nrow(GSEA_REACTOME_activated@result)),
+size_category = 1.0,
+min_edge = 0.3,
+layout = "kk",
+color = "NES"
+)
+#png(paste0("GSEA_REACTOME_", name, "_activated.png"), 1600, 800)
+print(p)
+#dev.off()
+} else {
+cat("Skipping activated plot (<=1 term)\n")
+}
+ 
+  # plot suppressed
+if (nrow(GSEA_REACTOME_suppressed@result) > 1) {
+p_sup <- emapplot(
+GSEA_REACTOME_suppressed,
+showCategory = min(40, nrow(GSEA_REACTOME_suppressed@result)),
+size_category = 1.0,
+min_edge = 0.3,
+layout = "kk",
+color = "NES"
+)
+#png(paste0("GSEA_REACTOME_", name, "_suppressed.png"), 1600, 800)
+print(p_sup)
+#dev.off()
+} else {
+cat("Skipping suppressed plot (<=1 term)\n")
+}
+
+  # =========================================
+  # 🔹 7. ZAPIS do global environment
+  # =========================================
+
+  # Umożliwia zapis obiektów i wywołanie ich w terminalu (patrz: struktura obektów GSEA GO)
+  assign(paste0(name, "_GSEA_REACTOME"), GSEA_REACTOME, envir = .GlobalEnv)
+  assign(paste0(name, "_GSEA_REACTOME_activated"), GSEA_REACTOME_activated, envir = .GlobalEnv)
+  assign(paste0(name, "_GSEA_REACTOME_suppressed"), GSEA_REACTOME_suppressed, envir = .GlobalEnv)
+
+  cat("\n✔ Saved objects:\n")
+  cat(paste0(name, "_GSEA_REACTOME\n"))
+  cat(paste0(name, "_GSEA_REACTOME_activated\n"))
+  cat(paste0(name, "_GSEA_REACTOME_suppressed\n"))
+
+  cat("\nDONE:", name, "\n")
+}
+
+# 2) TGFMET vs MET
+#run_gsea_reactome("deg_MET_TGF_vs_TGF.csv")
+```
+
+```{r}
+# Na dole funkcji podmieniamy dla jakiego porównania chcemy zrobić analizę jeśli chcemy pojedynczo, zamiast pętli:
+
+# 1) TGF vs NC
+run_gsea_reactome("deg_TGF_vs_NC_fibro.csv")
+
+# 2) TGFMET vs MET
+run_gsea_reactome("deg_MET_TGF_vs_TGF_fibro.csv")
+
+# 3) MET vs NC 
+run_gsea_reactome("deg_MET_vs_NC_fibro.csv")
+```
+
+## STRUKTURA OBIEKTÓW GSEA_REACTOME
+```{r}
+# Jeśli chcemy wywołać cały plik wystarczy wpisać te nazwy w terminalu:
+#deg_TGF_vs_NC_fibro_GSEA_REACTOME
+#deg_TGF_vs_NC_fibro_GSEA_REACTOME_activated
+#deg_TGF_vs_NC_fibro_GSEA_REACTOME_suppressed
+
+#deg_MET_TGF_vs_TGF_fibro_GSEA_REACTOME
+#deg_MET_TGF_vs_TGF_fibro_GSEA_REACTOME_activated
+#deg_MET_TGF_vs_TGF_fibro_GSEA_REACTOME_suppressed
+
+#deg_MET_vs_NC_fibro_GSEA_REACTOME
+#deg_MET_vs_NC_fibro_GSEA_REACTOME_activated
+#deg_MET_vs_NC_fibro_GSEA_REACTOME_suppressed
+
+# Funkcja do wywołania konkretnych parametrów (head_nazwapliku@result(wybrane))
+```
+
+
+# EKSTRAKCJA GENÓW Z WYBRANEJ BAZY G0, GO HIERARCHY, KEGG LUB REACTOME 
+
+```{r}
+
+# Ekstrakcja genów z GSEA_GO_HIERARCHY
+# Przykład dla pojedynczego przebiegu funkcji (poniżej zautomatyzowana pętla)
+
+  # =========================================
+  # 🔹 1. WYBÓR KONKRETNEJ KATEGORII 
+  # =========================================
+
+# Filtrujemy/wybieramy 1 kategorię z konkretnego porównania grup badawczych, z konkretnej bazy
+# Robimy to na bazie full, czyli całość bez rodzielania na aktywowane czy suppressowane
+Metabolism_TGF_vs_NC_fibro_hier_full <- TGF_vs_NC_fibro_hier_full %>% 
+filter(Category == "Metabolism")
+
+cat("[1] FILTER CATEGORY\n") # checkpoint
+cat("Rows:", nrow(Metabolism_TGF_vs_NC_fibro_hier_full), "\n")
+
+  # ====================================================
+  # 🔹 2. ROZBIJANIE CORE_ENRICHMENT NA POJEDYNCZE GENY
+  # ====================================================
+
+# Każda ścieżka ma swoje kluczowe geny (core), które są zapisane w formie gene/gene/gene - należy to rozbić do analizy
+# Można to zobaczyć wywołując strukturę pliku np. Metabolism_TGF_vs_NC_hier_full
+
+Metabolism_genes_TGF_vs_NC_fibro_hier_full <- Metabolism_TGF_vs_NC_fibro_hier_full %>%
+mutate(core_enrichment = strsplit(core_enrichment, "/")) %>%
+unnest(core_enrichment)
+
+cat("[2] SPLIT CORE ENRICHMENT\n") # checkpoint
+cat("Rows after unnest:", nrow(Metabolism_genes_TGF_vs_NC_fibro_hier_full), "\n")
+
+  # =========================================
+  # 🔹 3. MAPOWANIE ENTREZID -> SYMBOL
+  # =========================================
+  GeneMap_Metabolism_TGF_vs_NC_fibro_hier_full <- bitr(
+  Metabolism_genes_TGF_vs_NC_fibro_hier_full$core_enrichment,
+  fromType = "ENTREZID",
+  toType = "SYMBOL",
+  OrgDb = org.Hs.eg.db
+  )
+
+cat("[3] MAPPED GENES\n") # checkpoint
+cat("Mapped genes:", nrow(GeneMap_Metabolism_TGF_vs_NC_fibro_hier_full), "\n")
+
+  # =========================================
+  # 🔹 4. MERGE Z PATHWAYAMI
+  # =========================================
+  Metabolism_genes_TGF_vs_NC_fibro_hier_full <- Metabolism_genes_TGF_vs_NC_fibro_hier_full %>%
+  left_join(GeneMap_Metabolism_TGF_vs_NC_fibro_hier_full, by = c("core_enrichment" = "ENTREZID")) # left_join dodaje kolejną kolumnę z nazwą genu do naszej wcześniejszej tabeli
+
+cat("[4] MERGE PATHWAYS\n") # checkpoint
+cat("Rows after join:", nrow(Metabolism_genes_TGF_vs_NC_fibro_hier_full), "\n")
+
+  # =========================================
+  # 🔹 5. SPRZĄTANIE
+  # =========================================
+
+  Metabolism_genes_clean_TGF_vs_NC_fibro_hier_full <- Metabolism_genes_TGF_vs_NC_fibro_hier_full %>%
+  dplyr::select(
+  pathway = Description,
+  gene = SYMBOL,
+  ENTREZID = core_enrichment,
+  NES,
+  p.adjust
+  ) %>%
+  dplyr::distinct() %>% # usunięcie wierszy powtarzających się
+  dplyr::filter(!is.na(gene)) # usunięcie wartości NA
+
+cat("[5] CLEANING\n") # checkpoint
+cat("Rows after cleaning:", nrow(Metabolism_genes_clean_TGF_vs_NC_fibro_hier_full), "\n")
+
+  # =========================================
+  # 🔹 6. SORTOWANIE
+  # =========================================
+
+Metabolism_genes_clean_TGF_vs_NC_fibro_hier_full <- Metabolism_genes_clean_TGF_vs_NC_fibro_hier_full %>%
+arrange(p.adjust, desc(NES)) #rosnąco po p-value a malejąco po NES
+
+cat("[6] SORTING\n") # checkpoint
+cat("Rows after sorting:", nrow(Metabolism_genes_clean_TGF_vs_NC_fibro_hier_full), "\n")
+
+  # =========================================
+  # 🔹 7. CUT-OFF p.adjust i NES
+  # =========================================
+
+  Metabolism_genes_cutoff_TGF_vs_NC_fibro_hier_full <- Metabolism_genes_clean_TGF_vs_NC_fibro_hier_full %>%
+dplyr::filter(
+p.adjust < 0.05,
+abs(NES) > 1 #wartość bezwzzględna (absolutna)
+)
+
+cat("[7] APPLY CUT-OFF\n") # checkpoint
+cat("Rows after cutoff:", nrow(Metabolism_genes_cutoff_TGF_vs_NC_fibro_hier_full), "\n")
+
+  # =========================================
+  # 🔹 8. UNIKALNE GENY
+  # =========================================
+
+# Jeśli gen pojawia się w kilku pathwayach, zostaje tylko jeden wiersz
+
+Metabolism_genes_unique_TGF_vs_NC_fibro_hier_full <- Metabolism_genes_cutoff_TGF_vs_NC_fibro_hier_full %>%
+dplyr::distinct(gene, .keep_all = TRUE)
+
+cat("[8] UNIQUE GENES\n") # checkpoint
+cat("Unique genes:", nrow(Metabolism_genes_unique_TGF_vs_NC_fibro_hier_full), "\n")
+  
+  DEBUG <- TRUE
+  if (DEBUG) {
+    cat("Top 10 genes:\n")
+    print(head(Metabolism_genes_unique_TGF_vs_NC_fibro_hier_full$gene, 10))
+  }
+
+  # Jak chcemy sprawdzić jakie to są konkretnie geny możemy w terminalu wpisać Metabolism_genes_unique_TGF_vs_NC_hier_full$gene
+```
+
+# PORÓWNANIE GENÓW Z DEG Z TYMI Z GSEA_GO_hierarchy
+
+```{r}
+
+  # ==============================================
+  # 🔹 9. PORÓWNANIE Z DEG
+  # ==============================================
+
+# Wczytanie DEG
+deg_TGF_vs_NC_fibro <- read.csv("C:/Users/magda/Desktop/Lib_11_MTs_analiza od DEG/Fibro/deg_TGF_vs_NC_fibro.csv")
+
+cat("[9] DEG loaded\n")
+cat("Rows:", nrow(deg_TGF_vs_NC_fibro), "\n")
+
+# Filtrowanie DEG
+deg_TGF_vs_NC_fibro_cutoff <- deg_TGF_vs_NC_fibro %>%
+  dplyr::filter(abs(logFC) > 1, FDR < 0.05) %>%
+  dplyr::select(gene, logFC, FDR)
+
+cat("[9] DEG filtered\n")
+cat("Rows after cutoff:", nrow(deg_TGF_vs_NC_fibro_cutoff), "\n")
+
+# POŁĄCZENIE
+Metabolism_genes_in_both_TGF_vs_NC_fibro <- Metabolism_genes_unique_TGF_vs_NC_fibro_hier_full %>%
+  inner_join(deg_TGF_vs_NC_fibro_cutoff, by = "gene")
+
+cat("[9] Genes in both DEG and GSEA\n")
+cat("Rows:", nrow(Metabolism_genes_in_both_TGF_vs_NC_fibro), "\n")
+
+# zapis tylko genów wspólnych (GSEA + DEG)
+write.csv(Metabolism_genes_in_both_TGF_vs_NC_fibro$gene,
+          "Metabolism_genes_of_interest_tgf_nc_fibro.csv",
+          row.names = FALSE)
+
+# Wczytanie obiektu Seurat Fibro
+Fibro <- readRDS("C:/Users/magda/Desktop/Lib_11_MTs_analiza od DEG/Fibro.rds") 
+
+  # =========================================
+  # 🔹 FUNKCJA I WYWOŁANIE WSPÓLNYCH GENÓW
+  # =========================================
+Metabolism_genes_list_TGF_vs_NC_fibro <- Metabolism_genes_in_both_TGF_vs_NC_fibro$gene
+```
+
+```{r}
+plot_vln_batches <- function(
+  seurat_obj,
+  genes,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "VlnPlot",
+  category_name = NULL,  
+  pt.size = 0.5
+) {
+  
+  library(Seurat)
+  library(ggplot2)
+  
+  genes <- unique(genes)
+  
+  batch_size <- ncol * nrow
+  n_genes <- length(genes)
+  n_batches <- ceiling(n_genes / batch_size)
+  
+  # podział na batches
+  batches <- split(genes, cut(seq_along(genes), n_batches, labels = FALSE))
+  
+  cat("Total genes:", n_genes, "\n")
+  cat("Batches:", n_batches, "\n")
+  
+  # dodanie kategorii do prefiksu jeśli istnieje
+  if (!is.null(category_name)) {
+    output_prefix <- paste0(output_prefix, "_", category_name)
+  }
+
+  for (i in seq_along(batches)) {
+    
+    batch_genes <- batches[[i]]
+    
+    cat("Plotting batch", i, "with", length(batch_genes), "genes\n")
+    
+    p <- VlnPlot(
+      seurat_obj,
+      features = batch_genes,
+      group.by = group_by,
+      pt.size = pt.size,
+      ncol = ncol
+    ) +
+      theme(legend.position = 'none')
+    
+    ggsave(
+      filename = paste0(output_prefix, "_batch_", i, ".png"),
+      plot = p,
+      width = ncol * 4,
+      height = nrow * 3,
+      dpi = 300
+    )
+  }
+}
+```
+
+```{r}
+plot_vln_batches(
+  seurat_obj = Fibro, 
+  genes = Metabolism_genes_list_TGF_vs_NC_fibro, 
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "tgf_nc_fibro",
+  category_name = "Metabolism",
+  pt.size = 0.5
+)
+```
+
+# PĘTLA DLA WSZYSTKICH KATEGORII W POJEDYNCZYM PORÓWNANIU
+```{r}
+# =========================================
+# 🔹 0. FUNKCJA DO PLOTOWANIA VIOLIN PLOTS W BATCHACH
+# =========================================
+plot_vln_batches <- function(
+  seurat_obj,
+  genes,
+  group_by = "Sample",
+  ncol = 2,
+  nrow = 2,
+  output_prefix = "VlnPlot",
+  category_name = NULL,  
+  pt.size = 0.5
+) {
+  
+  genes <- unique(genes)
+  n_genes <- length(genes)
+  
+  if (n_genes == 0) {
+    cat("⚠ No genes to plot\n")
+    return(NULL)
+  }
+  
+  batch_size <- ncol * nrow
+  
+  if (n_genes <= batch_size) {
+    batches <- list(genes)
+  } else {
+    batches <- split(genes, ceiling(seq_along(genes)/batch_size))
+  }
+  
+  plot_list <- list()   # 🔥 tutaj zbieramy ploty
+  
+  for (i in seq_along(batches)) {
+    
+    batch_genes <- batches[[i]]
+    cat("Plotting batch", i, "with", length(batch_genes), "genes\n")
+    
+    p <- VlnPlot(
+      seurat_obj,
+      features = batch_genes,
+      group.by = group_by,
+      pt.size = pt.size,
+      ncol = ncol
+    ) +
+      theme(legend.position = 'none')
+    
+    # zapis PNG
+    ggsave(
+      filename = paste0(output_prefix, "_", category_name, "_batch_", i, ".png"),
+      plot = p,
+      width = ncol * 4,
+      height = nrow * 3,
+      dpi = 300
+    )
+    
+    # 🔥 zapis do listy
+    plot_list[[paste0(category_name, "_batch_", i)]] <- p
+  }
+  
+  return(plot_list)
+}
+
+# =========================================
+# 🔹 1. FUNKCJA DO PRZEPRACOWANIA WSZYSTKICH KATEGORII
+# =========================================
+run_for_all_categories <- function(input_df, Fibro, deg_file) {
+
+
+  categories <- unique(input_df$Category)
+  
+  cat("Detected categories:\n")
+  print(categories)
+
+  all_plots <- list()   # 🔥 tutaj zbieramy WSZYSTKO
+
+  for (cat_name in categories) {
+    
+    cat("\n=====================================\n")
+    cat("PROCESSING:", cat_name, "\n")
+    cat("=====================================\n")
+    
+    # 🔹 1. FILTER
+    filtered_df <- input_df %>% 
+      dplyr::filter(Category == cat_name)
+    
+    if (nrow(filtered_df) == 0) {
+      next
+    }
+    
+    # 🔹 2. CORE ENRICHMENT
+    genes_df <- filtered_df %>%
+      mutate(core_enrichment = strsplit(core_enrichment, "/")) %>%
+      tidyr::unnest(core_enrichment)
+    
+    # 🔹 3. MAPOWANIE
+    gene_map <- bitr(
+      genes_df$core_enrichment,
+      fromType = "ENTREZID",
+      toType = "SYMBOL",
+      OrgDb = org.Hs.eg.db
+    )
+    
+    genes_df <- genes_df %>%
+      left_join(gene_map, by = c("core_enrichment" = "ENTREZID"))
+    
+    # 🔹 4. CLEAN
+    genes_df <- genes_df %>%
+      dplyr::select(
+        pathway = Description,
+        gene = SYMBOL,
+        ENTREZID = core_enrichment,
+        NES,
+        p.adjust
+      ) %>%
+      dplyr::distinct() %>%
+      dplyr::filter(!is.na(gene))
+    
+    # 🔹 5. FILTER
+    genes_df <- genes_df %>%
+      arrange(p.adjust, desc(NES)) %>%
+      dplyr::filter(p.adjust < 0.05, abs(NES) > 1)
+    
+    genes_unique <- genes_df %>%
+      dplyr::distinct(gene, .keep_all = TRUE)
+    
+    cat("Unique genes:", nrow(genes_unique), "\n")
+    
+    # 🔹 6. DEG
+    deg <- read.csv(deg_file)
+    
+    deg_cut <- deg %>%
+      dplyr::filter(abs(logFC) > 1, FDR < 0.05) %>%
+      dplyr::select(gene, logFC, FDR)
+    
+    genes_in_both <- genes_unique %>%
+      inner_join(deg_cut, by = "gene")
+    
+    cat("Genes after intersection:", nrow(genes_in_both), "\n")
+    
+    if (nrow(genes_in_both) == 0) {
+      next
+    }
+    
+    # 🔹 7. CSV
+    comparison_name <- gsub("deg_|\\.csv$", "", basename(deg_file))
+
+    write.csv(
+    genes_in_both$gene,
+    paste0(cat_name, "_", comparison_name, "_genes_of_interest_fibro.csv"),
+    row.names = FALSE
+    )
+
+    # 🔹 8. PLOT + ZBIERANIE
+    plots <- plot_vln_batches(
+      seurat_obj = Fibro,
+      genes = genes_in_both$gene,
+      group_by = "Sample",
+      ncol = 2,
+      nrow = 2,
+      output_prefix = comparison_name,
+      category_name = cat_name,
+      pt.size = 0.5
+    )
+    
+    all_plots[[cat_name]] <- plots
+  }
+
+  return(all_plots)   # 🔥 KLUCZOWE
+}
+
+# Wczytanie obiektu Seurat Fibro
+Fibro <- readRDS("C:/Users/magda/Desktop/Lib_11_MTs_analiza od DEG/Fibro.rds") 
+  
+# =========================================
+# WYWOŁANIE FUNKCJI
+# =========================================
+plots_list_mettgf_tgf <- run_for_all_categories(
+  input_df = TGFMET_vs_TGF_fibro_hier_full,   # 🔥 zamieniasz tu
+  Fibro = Fibro,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_analiza od DEG/Fibro/deg_MET_TGF_vs_TGF_fibro.csv"
+)
+
+
+plots_list_tgf_nc <- run_for_all_categories(
+  input_df = TGF_vs_NC_fibro_hier_full,   # 🔥 zamieniasz tu
+  Fibro = Fibro,
+  deg_file = "C:/Users/magda/Desktop/Lib_11_MTs_analiza od DEG/Fibro/deg_TGF_vs_NC_fibro.csv"
+)
+
+```
+
+```{r}
+
+for (cat_name in names(plots_list_mettgf_tgf)) {
+  
+  cat("\n====================\n")
+  cat("CATEGORY:", cat_name, "\n")
+  cat("====================\n")
+  
+  for (plot_name in names(plots_list_mettgf_tgf[[cat_name]])) {
+    
+    cat("Plot:", plot_name, "\n")
+    
+    print(plots_list_mettgf_tgf[[cat_name]][[plot_name]])
+  }
+}
+
+```
+
+
+```{r}
+
+for (cat_name in names(plots_list_tgf_nc)) {
+  
+  cat("\n====================\n")
+  cat("CATEGORY:", cat_name, "\n")
+  cat("====================\n")
+  
+  for (plot_name in names(plots_list_tgf_nc[[cat_name]])) {
+    
+    cat("Plot:", plot_name, "\n")
+    
+    print(plots_list_tgf_nc[[cat_name]][[plot_name]])
+  }
+}
+
+```
